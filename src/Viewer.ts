@@ -18,7 +18,7 @@ export interface Wall {
     highlighted?: boolean;
 }
 
-export class Viewer{
+export class Viewer {
     private container: HTMLElement;
     private renderer: WebGLRenderer;
     private scene2D: Scene;
@@ -30,30 +30,47 @@ export class Viewer{
     private is2D: boolean = true;
     private walls: Wall[] = [];
     private wallCounter: number = 0;
-    private isDrawing: boolean = false;
-    private currentStartPoint: Vector3 | null = null;
-    private tempLine: Line | null = null;
+    private modeIndicator: HTMLDivElement;
+
     private wallMeshes: Map<string, Object3D> = new Map();
+    private dimensionLines: Map<string, { line: Line, label: HTMLDivElement }> = new Map();
     private raycaster: Raycaster = new Raycaster();
     private mouse: Vector2 = new Vector2();
     private textureLoader: TextureLoader = new TextureLoader();
     private intersectionPlane: Plane;
 
-    constructor(container: HTMLElement){
-        this.container=container;
+    // New properties for drawing
+    private isDrawing: boolean = false;
+    private startPoint: Vector3 | null = null;
+    private previewLine: Line | null = null;
+
+    // New property for wall list element
+    private wallListElement: HTMLUListElement | null = null;
+    private selectedWall: string | null = null;
+
+    // New property to track if we're in drawing mode
+    private isDrawingMode: boolean = true;
+
+    constructor(container: HTMLElement) {
+        this.container = container;
         this.intersectionPlane = new Plane(new Vector3(0, 0, 1), 0);
-   
-        this.renderer=this.createRenderer();
-            this.renderer.setSize(container.clientWidth,container.clientHeight);
-            this.renderer.setPixelRatio(window.devicePixelRatio);
+
+        // Create mode indicator
+        this.modeIndicator = this.createModeIndicator();
+        this.container.appendChild(this.modeIndicator);
+        this.updateModeIndicator();
+
+        this.renderer = this.createRenderer();
+        this.renderer.setSize(container.clientWidth, container.clientHeight);
+        this.renderer.setPixelRatio(window.devicePixelRatio);
         container.append(this.renderer.domElement);
-     
-        this.scene2D=this.createScene2D();
-        this.scene3D=this.createScene3D();
-        this.camera2D=this.createCamera2D();
-        this.camera3D=this.createCamera3D();
-        this.controls2D=this.createControls2D();
-        this.controls3D=this.createControls3D();
+
+        this.scene2D = this.createScene2D();
+        this.scene3D = this.createScene3D();
+        this.camera2D = this.createCamera2D();
+        this.camera3D = this.createCamera3D();
+        this.controls2D = this.createControls2D();
+        this.controls3D = this.createControls3D();
         this.setup();
         this.animate();
 
@@ -63,18 +80,29 @@ export class Viewer{
 
     private setup() {
         // Add event listeners
-        window.addEventListener('mousemove', this.onMouseMove.bind(this));
         window.addEventListener('mousedown', this.onMouseDown.bind(this));
+        window.addEventListener('mousemove', this.onMouseMove.bind(this));
         window.addEventListener('mouseup', this.onMouseUp.bind(this));
         window.addEventListener('contextmenu', (e) => e.preventDefault()); // Prevent right-click menu
 
         // Add grid and lights to both scenes
         this.addGridAndLights(this.scene2D);
         this.addGridAndLights(this.scene3D);
+
+        // Get wall list element and set up event listeners
+        this.wallListElement = document.getElementById('wall-list') as HTMLUListElement;
+        if (this.wallListElement) {
+            this.wallListElement.addEventListener('mouseover', this.onWallListItemMouseOver.bind(this));
+            this.wallListElement.addEventListener('mouseout', this.onWallListItemMouseOut.bind(this));
+            this.wallListElement.addEventListener('click', this.onWallListItemClick.bind(this));
+        }
+
+        // Fit the view to the grid or walls on startup
+        this.zoomExtend();
     }
 
     private createRenderer(): WebGLRenderer {
-        var renderer=new WebGLRenderer({antialias:true});
+        const renderer = new WebGLRenderer({ antialias: true });
         return renderer;
     }
 
@@ -92,16 +120,18 @@ export class Viewer{
 
     private createCamera2D(): OrthographicCamera {
         const aspect = this.container.clientWidth / this.container.clientHeight;
-        const frustumSize = 100;
+        const frustumSize = 500; // Increased to handle larger distances
         const camera = new OrthographicCamera(
             -frustumSize * aspect / 2,
             frustumSize * aspect / 2,
             frustumSize / 2,
             -frustumSize / 2,
             1,
-            100
+            1000
         );
-        camera.position.set(0, 0, 5);
+        // Position the camera for a top-down view (XY plane)
+        camera.position.set(0, 0, 50); // Position on Z axis looking down
+        camera.lookAt(0, 0, 0);
         return camera;
     }
 
@@ -134,10 +164,19 @@ export class Viewer{
     private addGridAndLights(scene: Scene) {
         // Add grid
         const grid = new GridHelper(100, 100);
+        // Rotate grid to lie on the XY plane for 2D view, keep default for 3D
+        if (scene === this.scene2D) {
+             grid.rotation.x = Math.PI / 2; // Rotate 90 degrees around X to get XY plane
+        }
         scene.add(grid);
 
         // Add axes helper
         const axesHelper = new AxesHelper(2);
+        // Re-orient axes for 2D (XY plane) view: Red=X, Green=Y, Blue=Z (up)
+        if (scene === this.scene2D) {
+             axesHelper.rotation.x = Math.PI / 2; // Align axes with rotated grid
+        }
+
         scene.add(axesHelper);
 
         // Add lights
@@ -153,29 +192,34 @@ export class Viewer{
         this.is2D = is2D;
         if (is2D) {
             this.controls2D.update();
+            // Show dimension lines in 2D
+            this.dimensionLines.forEach((dimension) => {
+                dimension.line.visible = true;
+                dimension.label.style.display = 'block';
+            });
         } else {
             this.controls3D.update();
             this.update3DView();
+            // Hide dimension lines in 3D
+            this.dimensionLines.forEach((dimension) => {
+                dimension.line.visible = false;
+                dimension.label.style.display = 'none';
+            });
         }
     }
 
     private update3DView() {
-        // Clear existing 3D meshes
         this.wallMeshes.forEach(mesh => this.scene3D.remove(mesh));
         this.wallMeshes.clear();
-        // Recreate all walls in 3D
         this.walls.forEach(wall => this.createWallMesh3D(wall));
     }
 
     private createWallMesh3D(wall: Wall) {
-        const wallHeight = 3; // meters
-        const wallThickness = 0.2; // meters
+        const wallHeight = 3;
+        const wallThickness = 0.2;
         const wallLength = wall.length;
 
-        // Create wall geometry
         const geometry = new BoxGeometry(wallLength, wallHeight, wallThickness);
-
-        // Load and apply wall texture
         const texture = this.textureLoader.load('/textures/brick.jpg');
         texture.wrapS = texture.wrapT = 1000;
         texture.repeat.set(wallLength / 2, wallHeight / 2);
@@ -188,11 +232,9 @@ export class Viewer{
         });
 
         const mesh = new Mesh(geometry, material);
-
-        // Position and rotate the wall
         const midPoint = new Vector3().addVectors(wall.start, wall.end).multiplyScalar(0.5);
         mesh.position.set(midPoint.x, wallHeight / 2, midPoint.y);
-        mesh.rotation.y = -wall.angle; // Negative for correct orientation
+        mesh.rotation.y = -wall.angle;
 
         mesh.userData.wallId = wall.id;
         this.scene3D.add(mesh);
@@ -217,115 +259,123 @@ export class Viewer{
         if (!this.is2D) {
             this.createWallMesh3D(wall);
         }
+        this.updateWallList(); // Update list when wall is added
         return wall;
     }
 
     private createWallMesh2D(wall: Wall) {
-        // Create a line for the wall
+        // Create the wall line
         const material = new LineBasicMaterial({ 
-            color: wall.selected ? 0xff0000 : (wall.highlighted ? 0x00ff00 : 0x000000)
+            color: wall.selected ? 0xff0000 : (wall.highlighted ? 0x00ff00 : 0x000000),
+            linewidth: 2 // Note: linewidth only works in WebGL 2
         });
         const points = [wall.start, wall.end];
         const geometry = new BufferGeometry().setFromPoints(points);
         const line = new Line(geometry, material);
         line.userData.wallId = wall.id;
 
-        // Create a rectangle for wall thickness
-        const wallThickness = 0.2;
+        // Create a thicker wall mesh for better interaction
+        const wallThickness = 0.5; // Increased thickness for better hover detection
         const wallLength = wall.length;
         const wallGeometry = new BoxGeometry(wallLength, wallThickness, 0.01);
         const wallMaterial = new MeshStandardMaterial({ 
             color: wall.selected ? 0xff0000 : (wall.highlighted ? 0x00ff00 : 0xcccccc),
-            side: DoubleSide
+            side: DoubleSide,
+            transparent: true,
+            opacity: 0.6 // Semi-transparent to see the line underneath
         });
         const wallMesh = new Mesh(wallGeometry, wallMaterial);
 
-        // Position and rotate the wall mesh
+        // Position and rotate the wall mesh on the XY plane, slightly above Z=0
         const midPoint = new Vector3().addVectors(wall.start, wall.end).multiplyScalar(0.5);
-        wallMesh.position.set(midPoint.x, midPoint.y, 0);
+        wallMesh.position.set(midPoint.x, midPoint.y, 0.01);
         wallMesh.rotation.z = wall.angle;
         wallMesh.userData.wallId = wall.id;
 
         this.scene2D.add(line);
         this.scene2D.add(wallMesh);
         this.wallMeshes.set(wall.id, wallMesh);
-
-        // Add dimension label
-        this.addDimensionLabel(wall);
+        
+        // Add dimension line
+        this.createDimensionLine(wall);
     }
 
-    private onMouseMove(e: MouseEvent) {
-        this.updateMousePosition(e);
+    private createDimensionLine(wall: Wall) {
+        // Remove existing dimension line if any
+        this.removeDimensionLine(wall.id);
 
-        if (this.is2D) {
-            if (this.isDrawing && this.currentStartPoint) {
-                const intersects = this.getIntersectionPoint();
-                if (intersects) {
-                    this.updateTempLine(this.currentStartPoint, intersects);
-                }
-            } else {
-                // Check for wall highlighting
-                const intersects = this.getWallIntersection();
-                if (intersects.length > 0) {
-                    const wallId = intersects[0].object.userData.wallId;
-                    this.highlightWall(wallId);
-                } else {
-                    this.clearWallStates();
-                }
-            }
-        }
+        // Calculate offset for dimension line (perpendicular to wall)
+        const wallVector = new Vector2(wall.end.x - wall.start.x, wall.end.y - wall.start.y);
+        const perpendicular = new Vector2(-wallVector.y, wallVector.x).normalize();
+        const offset = 0.5; // Offset distance from wall
+
+        // Create dimension line points with offset
+        const startPoint = new Vector3(
+            wall.start.x + perpendicular.x * offset,
+            wall.start.y + perpendicular.y * offset,
+            0.02
+        );
+        const endPoint = new Vector3(
+            wall.end.x + perpendicular.x * offset,
+            wall.end.y + perpendicular.y * offset,
+            0.02
+        );
+
+        // Create the dimension line
+        const geometry = new BufferGeometry().setFromPoints([startPoint, endPoint]);
+        const material = new LineBasicMaterial({ color: 0x000000 });
+        const line = new Line(geometry, material);
+        this.scene2D.add(line);
+
+        // Create HTML label for dimension
+        const label = document.createElement('div');
+        label.style.position = 'absolute';
+        label.style.backgroundColor = 'white';
+        label.style.border = '1px solid black';
+        label.style.padding = '2px 5px';
+        label.style.borderRadius = '3px';
+        label.style.fontSize = '12px';
+        label.style.pointerEvents = 'none';
+        label.style.fontFamily = 'Arial, sans-serif';
+        this.container.appendChild(label);
+
+        // Store the dimension line and label
+        this.dimensionLines.set(wall.id, { line, label });
+
+        // Update the label position
+        this.updateDimensionLabel(wall);
     }
 
-    private onMouseDown(e: MouseEvent) {
-        if (this.is2D) {
-            if (e.button === 0) { // Left click
-                const intersects = this.getIntersectionPoint();
-                if (intersects) {
-                    if (!this.isDrawing) {
-                        // Start drawing
-                        this.isDrawing = true;
-                        this.currentStartPoint = intersects;
-                        this.tempLine = this.createTempLine(intersects, intersects);
-                        this.scene2D.add(this.tempLine);
-                    } else {
-                        // Finish drawing
-                        const wall = this.addWall(this.currentStartPoint!, intersects);
-                        this.isDrawing = false;
-                        this.scene2D.remove(this.tempLine!);
-                        this.tempLine = null;
-                        this.currentStartPoint = null;
-                    }
-                }
-            } else if (e.button === 2) { // Right click
-                // Handle wall selection
-                const intersects = this.getWallIntersection();
-                if (intersects.length > 0) {
-                    const wallId = intersects[0].object.userData.wallId;
-                    this.selectWall(wallId);
-                } else {
-                    this.clearWallStates();
-                }
-            }
-        }
+    private updateDimensionLabel(wall: Wall) {
+        const dimension = this.dimensionLines.get(wall.id);
+        if (!dimension) return;
+
+        // Get the midpoint of the dimension line
+        const midPoint = new Vector3()
+            .addVectors(wall.start, wall.end)
+            .multiplyScalar(0.5);
+
+        // Project the 3D midpoint to screen coordinates
+        const screenPosition = midPoint.clone().project(this.camera2D);
+        
+        // Convert to pixel coordinates
+        const x = (screenPosition.x + 1) * this.container.clientWidth / 2;
+        const y = (-screenPosition.y + 1) * this.container.clientHeight / 2;
+
+        // Update label position and content
+        dimension.label.style.left = `${x}px`;
+        dimension.label.style.top = `${y}px`;
+        dimension.label.textContent = `${wall.length.toFixed(2)}m`;
     }
 
-    private onMouseUp(e: MouseEvent) {
-        // Handle any mouse up events if needed
-    }
-
-    private createTempLine(start: Vector3, end: Vector3): Line {
-        const material = new LineBasicMaterial({ color: 0x0000ff });
-        const points = [start, end];
-        const geometry = new BufferGeometry().setFromPoints(points);
-        return new Line(geometry, material);
-    }
-
-    private updateTempLine(start: Vector3, end: Vector3) {
-        if (this.tempLine) {
-            const positions = this.tempLine.geometry.attributes.position;
-            positions.setXYZ(0, start.x, start.y, start.z);
-            positions.setXYZ(1, end.x, end.y, end.z);
-            positions.needsUpdate = true;
+    private removeDimensionLine(wallId: string) {
+        const dimension = this.dimensionLines.get(wallId);
+        if (dimension) {
+            this.scene2D.remove(dimension.line);
+            dimension.line.geometry.dispose();
+            (dimension.line.material as LineBasicMaterial).dispose();
+            dimension.label.remove();
+            this.dimensionLines.delete(wallId);
         }
     }
 
@@ -336,9 +386,17 @@ export class Viewer{
     }
 
     private getIntersectionPoint(): Vector3 | null {
-        this.raycaster.setFromCamera(this.mouse, this.is2D ? this.camera2D : this.camera3D);
-        const intersects = this.raycaster.ray.intersectPlane(this.intersectionPlane, new Vector3());
-        return intersects || null;
+        if (this.is2D) {
+            // Unproject mouse coordinates to the Z=0 plane in 2D view
+            const vector = new Vector3(this.mouse.x, this.mouse.y, 0.5); // Use 0.5 for depth in NDC
+            vector.unproject(this.camera2D);
+            return new Vector3(vector.x, vector.y, 0); // Return point on Z=0 plane
+        } else {
+            // Use raycasting for intersection in 3D view
+            this.raycaster.setFromCamera(this.mouse, this.camera3D);
+            const intersects = this.raycaster.ray.intersectPlane(this.intersectionPlane, new Vector3());
+            return intersects || null;
+        }
     }
 
     private getWallIntersection(): any[] {
@@ -349,7 +407,15 @@ export class Viewer{
 
     private animate() {
         requestAnimationFrame(this.animate.bind(this));
-        this.render();
+        
+        // Update dimension labels if in 2D mode
+        if (this.is2D) {
+            this.walls.forEach(wall => {
+                this.updateDimensionLabel(wall);
+            });
+        }
+        
+        this.renderer.render(this.is2D ? this.scene2D : this.scene3D, this.is2D ? this.camera2D : this.camera3D);
     }
 
     private render() {
@@ -363,54 +429,95 @@ export class Viewer{
     }
 
     private onWindowResize() {
-        // Update renderer size
         this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
         this.renderer.setPixelRatio(window.devicePixelRatio);
 
-        // Update 2D camera
         const aspect = this.container.clientWidth / this.container.clientHeight;
-        const frustumSize = 100;
+        const frustumSize = 500;
         this.camera2D.left = -frustumSize * aspect / 2;
         this.camera2D.right = frustumSize * aspect / 2;
         this.camera2D.top = frustumSize / 2;
         this.camera2D.bottom = -frustumSize / 2;
         this.camera2D.updateProjectionMatrix();
 
-        // Update 3D camera
         this.camera3D.aspect = aspect;
         this.camera3D.updateProjectionMatrix();
     }
 
     public zoomExtend() {
         if (this.is2D) {
-            // Calculate bounding box of all walls in 2D
-            const positions: Vector3[] = [];
-            this.walls.forEach(wall => {
-                positions.push(wall.start, wall.end);
-            });
+            let targetBox: Box2;
 
-            if (positions.length > 0) {
-                const box = new Box2().setFromPoints(positions.map(p => new Vector2(p.x, p.y)));
-                const center = box.getCenter(new Vector2());
-                const size = box.getSize(new Vector2());
-                const maxDim = Math.max(size.x, size.y);
-                
-                this.camera2D.position.set(center.x, center.y, 5);
-                this.camera2D.zoom = 1 / (maxDim * 1.2);
-                this.camera2D.updateProjectionMatrix();
-                this.controls2D.update();
+            if (this.walls.length > 0) {
+                // Calculate bounding box of all walls in 2D
+                const positions: Vector3[] = [];
+                this.walls.forEach(wall => {
+                    positions.push(wall.start, wall.end);
+                });
+                targetBox = new Box2().setFromPoints(positions.map(p => new Vector2(p.x, p.y)));
+
+                // Add padding to the wall bounding box
+                const padding = targetBox.getSize(new Vector2()).multiplyScalar(0.1); // 10% padding
+                targetBox.expandByVector(padding);
+
+            } else {
+                // If no walls, use the 100x100 grid extent as the target box
+                const gridExtent = 100;
+                targetBox = new Box2(new Vector2(-gridExtent / 2, -gridExtent / 2), new Vector2(gridExtent / 2, gridExtent / 2));
+
+                // Add padding to the grid bounding box
+                 const padding = targetBox.getSize(new Vector2()).multiplyScalar(0.1); // 10% padding
+                targetBox.expandByVector(padding);
             }
-        } else {
-            // Calculate bounding box of all walls in 3D
+
+            const center = targetBox.getCenter(new Vector2());
+            const size = targetBox.getSize(new Vector2());
+            const aspect = this.container.clientWidth / this.container.clientHeight;
+
+            // Calculate the viewable area needed to fit the target box
+            let viewWidth = size.x;
+            let viewHeight = size.y;
+
+            if (viewWidth / aspect > viewHeight) {
+                // If width is the limiting dimension
+                viewHeight = viewWidth / aspect;
+            } else {
+                // If height is the limiting dimension
+                viewWidth = viewHeight * aspect;
+            }
+
+            // Update the 2D camera's frustum to fit the calculated viewable area
+            const halfViewWidth = viewWidth / 2;
+            const halfViewHeight = viewHeight / 2;
+
+            this.camera2D.left = center.x - halfViewWidth;
+            this.camera2D.right = center.x + halfViewWidth;
+            this.camera2D.top = center.y + halfViewHeight;
+            this.camera2D.bottom = center.y - halfViewHeight;
+            this.camera2D.position.set(center.x, center.y, this.camera2D.position.z); // Maintain current Z position
+            this.camera2D.zoom = 1; // Reset zoom to 1 as we are setting frustum directly
+            this.camera2D.updateProjectionMatrix();
+
+            // Update controls target and limits
+            this.controls2D.target.set(center.x, center.y, 0); // Ensure controls are centered on the content plane
+             // Optional: Set controls limits based on the target box if you want to restrict panning
+            // this.controls2D.minPan = new Vector3(targetBox.min.x, targetBox.min.y, 0);
+            // this.controls2D.maxPan = new Vector3(targetBox.max.x, targetBox.max.y, 0);
+
+            this.controls2D.update();
+
+        } else { // 3D view
             const positions: Vector3[] = [];
             this.wallMeshes.forEach(mesh => {
-                const geometry = mesh.geometry;
-                const position = geometry.attributes.position;
-                for (let i = 0; i < position.count; i++) {
-                    const vertex = new Vector3();
-                    vertex.fromBufferAttribute(position, i);
-                    vertex.applyMatrix4(mesh.matrixWorld);
-                    positions.push(vertex);
+                if (mesh instanceof Mesh) {
+                    const geometry = mesh.geometry;
+                    const position = geometry.attributes.position;
+                    for (let i = 0; i < position.count; i++) {
+                        const vertex = new Vector3();
+                        vertex.fromBufferAttribute(position, i);
+                        vertex.applyMatrix4(mesh.matrixWorld);
+                        positions.push(vertex);
+                    }
                 }
             });
 
@@ -430,56 +537,335 @@ export class Viewer{
         }
     }
 
-    private addDimensionLabel(wall: Wall) {
-        const label = document.createElement('div');
-        label.className = 'dimension-label';
-        label.style.position = 'absolute';
-        label.style.color = 'black';
-        label.style.fontSize = '12px';
-        label.style.pointerEvents = 'none';
-        label.textContent = `${wall.length.toFixed(2)}m`;
-        
-        const midPoint = new Vector3().addVectors(wall.start, wall.end).multiplyScalar(0.5);
-        const screenPosition = midPoint.project(this.camera2D);
-        
-        const x = (screenPosition.x * 0.5 + 0.5) * this.container.clientWidth;
-        const y = (-screenPosition.y * 0.5 + 0.5) * this.container.clientHeight;
-        
-        label.style.left = `${x}px`;
-        label.style.top = `${y}px`;
-        
-        this.container.appendChild(label);
-    }
-
     private highlightWall(id: string) {
         this.walls.forEach(wall => {
-            wall.highlighted = wall.id === id;
-            this.updateWallAppearance(wall);
+            // Only update if state is actually changing to avoid unnecessary renders
+            if (wall.id === id && !wall.highlighted) {
+                wall.highlighted = true;
+                this.updateWallAppearance(wall.id);
+            } else if (wall.id !== id && wall.highlighted) {
+                 wall.highlighted = false;
+                 this.updateWallAppearance(wall.id);
+            }
         });
+        this.updateWallList(); // Always update the list to reflect highlight state changes
     }
 
     private selectWall(id: string) {
+        // Clear current selection first
+        this.clearWallStates();
+
         this.walls.forEach(wall => {
-            wall.selected = wall.id === id;
-            this.updateWallAppearance(wall);
+            if (wall.id === id) {
+                wall.selected = true;
+                this.selectedWall = id; // Keep track of the selected wall ID
+            } else {
+                wall.selected = false;
+            }
+             // Update appearance for all walls to reflect cleared state and new selection
+            this.updateWallAppearance(wall.id);
         });
+        this.updateWallList(); // Always update the list to reflect select state changes
     }
 
     private clearWallStates() {
         this.walls.forEach(wall => {
             wall.selected = false;
             wall.highlighted = false;
-            this.updateWallAppearance(wall);
+        });
+        this.selectedWall = null; // Clear selected wall ID
+
+         // Update appearances for all walls
+        this.walls.forEach(wall => this.updateWallAppearance(wall.id));
+        this.updateWallList(); // Update list to reflect cleared state
+    }
+
+    private updateWallAppearance(id: string) {
+        const wall = this.walls.find(w => w.id === id);
+        const mesh = this.wallMeshes.get(id);
+        if (wall && mesh && mesh instanceof Mesh) {
+            const material = mesh.material as MeshStandardMaterial;
+            material.color.setHex(wall.selected ? 0xff0000 : (wall.highlighted ? 0x00ff00 : 0xcccccc));
+        }
+    }
+
+    // New methods for wall list management
+    private updateWallList() {
+        if (!this.wallListElement) return;
+
+        // Clear current list
+        this.wallListElement.innerHTML = '';
+
+        // Populate list with walls
+        this.walls.forEach(wall => {
+            const listItem = document.createElement('li');
+            listItem.textContent = `Wall ${wall.id.split('_')[1]} (Length: ${wall.length.toFixed(2)}m)`;
+            listItem.dataset.wallId = wall.id; // Store wall id in data attribute
+             if (wall.selected) {
+                listItem.classList.add('selected');
+            }
+            this.wallListElement!.appendChild(listItem);
         });
     }
 
-    private updateWallAppearance(wall: Wall) {
-        const mesh = this.wallMeshes.get(wall.id);
-        if (mesh) {
-            if (mesh instanceof Mesh) {
-                const material = mesh.material as MeshStandardMaterial;
-                material.color.setHex(wall.selected ? 0xff0000 : (wall.highlighted ? 0x00ff00 : 0xcccccc));
+     private onWallListItemMouseOver(e: MouseEvent) {
+        const target = e.target as HTMLElement;
+        if (target.tagName === 'LI' && target.dataset.wallId) {
+            this.highlightWall(target.dataset.wallId);
+        }
+    }
+
+    private onWallListItemMouseOut(e: MouseEvent) {
+         const target = e.target as HTMLElement;
+        if (target.tagName === 'LI' && target.dataset.wallId) {
+             // Only clear highlight if it's not the selected wall
+            if (this.selectedWall !== target.dataset.wallId) {
+                 this.walls.find(wall => wall.id === target.dataset.wallId)!.highlighted = false;
+                 this.updateWallAppearance(target.dataset.wallId);
+                 this.updateWallList();
             }
         }
+    }
+
+    private onWallListItemClick(e: MouseEvent) {
+        const target = e.target as HTMLElement;
+        if (target.tagName === 'LI' && target.dataset.wallId) {
+            this.selectWall(target.dataset.wallId);
+        }
+    }
+
+    private onMouseDown(e: MouseEvent) {
+        if (!this.is2D) { // Handle interactions in 3D view
+            this.updateMousePosition(e);
+            const intersects = this.getWallIntersection();
+
+            if (intersects.length > 0) {
+                const wallId = intersects[0].object.userData.wallId;
+                this.selectWall(wallId);
+            } else {
+                this.clearWallStates();
+            }
+            return;
+        }
+
+        // Update mouse position
+        this.updateMousePosition(e);
+
+        // Handle based on current mode
+        if (this.isDrawingMode) {
+            // Drawing mode behavior
+            if (e.button !== 0) return; // Only handle left click for drawing
+
+            const intersection = this.getIntersectionPoint();
+            if (!intersection) return;
+
+            if (!this.isDrawing) {
+                // First click: Start drawing
+                this.isDrawing = true;
+                this.startPoint = intersection;
+
+                // Create initial preview line
+                const geometry = new BufferGeometry().setFromPoints([this.startPoint, intersection]);
+                const material = new LineBasicMaterial({ color: 0x0000ff });
+                this.previewLine = new Line(geometry, material);
+                this.scene2D.add(this.previewLine);
+            } else {
+                // Second click: End drawing and create wall
+                const endPoint = intersection;
+                this.addWall(this.startPoint!, endPoint);
+
+                // Clean up preview line
+                if (this.previewLine) {
+                    this.scene2D.remove(this.previewLine);
+                    this.previewLine.geometry.dispose();
+                    (this.previewLine.material as LineBasicMaterial).dispose();
+                    this.previewLine = null;
+                }
+
+                // If Shift is held, start a new wall from the end of the last one
+                if (e.shiftKey) {
+                    this.startPoint = endPoint;
+                    const geometry = new BufferGeometry().setFromPoints([this.startPoint, this.startPoint]);
+                    const material = new LineBasicMaterial({ color: 0x0000ff });
+                    this.previewLine = new Line(geometry, material);
+                    this.scene2D.add(this.previewLine);
+                } else {
+                    this.isDrawing = false;
+                    this.startPoint = null;
+                }
+            }
+        } else {
+            // Selection mode behavior
+            if (e.button === 0) { // Left click
+                const intersects = this.getWallIntersection();
+                if (intersects.length > 0) {
+                    const wallId = intersects[0].object.userData.wallId;
+                    this.selectWall(wallId);
+                } else {
+                    this.clearWallStates();
+                }
+            }
+        }
+    }
+
+    private onMouseMove(e: MouseEvent) {
+        this.updateMousePosition(e);
+
+        // Handle wall highlighting in 2D view (always active)
+        if (this.is2D) {
+            const intersects = this.getWallIntersection();
+            if (intersects.length > 0) {
+                const wallId = intersects[0].object.userData.wallId;
+                this.highlightWall(wallId);
+            } else if (!this.isDrawing) {
+                this.clearHighlight();
+            }
+        }
+
+        // Handle preview line update during drawing
+        if (this.is2D && this.isDrawingMode && this.isDrawing && this.startPoint && this.previewLine) {
+            const intersection = this.getIntersectionPoint();
+            if (intersection) {
+                const positions = (this.previewLine.geometry.attributes.position as any).array;
+                positions[3] = intersection.x;
+                positions[4] = intersection.y;
+                positions[5] = intersection.z;
+                this.previewLine.geometry.attributes.position.needsUpdate = true;
+            }
+        }
+    }
+
+    private onMouseUp(e: MouseEvent) {
+        // Mouse up is not used for drawing in the two-click method
+        // Keep for potential other interactions like selection drag
+    }
+
+    // New method to clear all walls
+    public clearAllWalls() {
+        // Remove all dimension lines
+        this.dimensionLines.forEach((dimension, wallId) => {
+            this.removeDimensionLine(wallId);
+        });
+        
+        // Remove all wall meshes from both scenes
+        this.wallMeshes.forEach(mesh => {
+            this.scene2D.remove(mesh);
+            this.scene3D.remove(mesh);
+            if (mesh instanceof Mesh) {
+                 mesh.geometry.dispose();
+                 (mesh.material as any).dispose(); // Dispose material(s)
+            }
+        });
+        this.wallMeshes.clear();
+
+        // Clear the walls array
+        this.walls = [];
+
+        // Clear the wall list
+        this.updateWallList();
+
+        // Clear any active selection/highlight
+        this.clearWallStates();
+
+        // Zoom to fit the grid
+        this.zoomExtend();
+    }
+
+    // New method to delete selected walls
+    public deleteSelectedWalls() {
+        const wallsToDelete = this.walls.filter(wall => wall.selected);
+
+        wallsToDelete.forEach(wall => {
+            // Remove dimension line
+            this.removeDimensionLine(wall.id);
+            
+            // Remove mesh from scenes and dispose
+            const mesh = this.wallMeshes.get(wall.id);
+            if (mesh) {
+                this.scene2D.remove(mesh);
+                this.scene3D.remove(mesh);
+                if (mesh instanceof Mesh) {
+                    mesh.geometry.dispose();
+                    (mesh.material as any).dispose(); // Dispose material(s)
+                }
+                this.wallMeshes.delete(wall.id);
+            }
+
+            // Remove wall from the walls array
+            const index = this.walls.indexOf(wall);
+            if (index !== -1) {
+                this.walls.splice(index, 1);
+            }
+        });
+
+        // Clear selection state and update list
+        this.clearWallStates();
+        this.updateWallList();
+
+        // Optional: Zoom to fit remaining walls or grid after deletion
+        this.zoomExtend();
+    }
+
+    private clearHighlight() {
+        this.walls.forEach(wall => {
+            if (wall.highlighted && !wall.selected) {
+                wall.highlighted = false;
+                this.updateWallAppearance(wall.id);
+            }
+        });
+    }
+
+    // Add method to toggle drawing mode
+    public toggleDrawingMode() {
+        this.isDrawingMode = !this.isDrawingMode;
+        
+        // Update the mode indicator
+        this.updateModeIndicator();
+        
+        // If turning off drawing mode, clean up any ongoing drawing
+        if (!this.isDrawingMode) {
+            this.cleanupDrawing();
+        }
+    }
+
+    // Add method to get current mode
+    public isInDrawingMode(): boolean {
+        return this.isDrawingMode;
+    }
+
+    private cleanupDrawing() {
+        // Clean up preview line if it exists
+        if (this.previewLine) {
+            this.scene2D.remove(this.previewLine);
+            this.previewLine.geometry.dispose();
+            (this.previewLine.material as LineBasicMaterial).dispose();
+            this.previewLine = null;
+        }
+        this.isDrawing = false;
+        this.startPoint = null;
+    }
+
+    private createModeIndicator(): HTMLDivElement {
+        const indicator = document.createElement('div');
+        indicator.className = 'mode-indicator drawing-mode';
+        
+        const icon = document.createElement('div');
+        icon.className = 'mode-indicator-icon';
+        
+        const text = document.createElement('span');
+        text.textContent = 'Drawing Mode';
+        
+        indicator.appendChild(icon);
+        indicator.appendChild(text);
+        
+        return indicator;
+    }
+
+    private updateModeIndicator() {
+        const text = this.modeIndicator.querySelector('span');
+        if (text) {
+            text.textContent = this.isDrawingMode ? 'Drawing Mode' : 'Selection Mode';
+        }
+        this.modeIndicator.className = `mode-indicator ${this.isDrawingMode ? 'drawing-mode' : 'selection-mode'}`;
     }
 }
